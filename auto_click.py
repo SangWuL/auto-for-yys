@@ -115,19 +115,20 @@ TOWER_DISMISS_CLICK_INTERVAL = (0.6, 1.0)  # 跳过结算页的点击间隔（�
 WINDOWS_TITLE = '百崽'
 # WINDOWS_TITLE = '雪之莹'
 
-# 运行方式：后台模式（PrintWindow 截图 + adb/PostMessage 点击，模拟器窗口可被遮挡/
+# 运行方式：后台模式（adb screencap 截图 + adb/PostMessage 点击，模拟器窗口可被遮挡/
 # 切到后台，不占用真实鼠标键盘，但窗口不能最小化）
 # 命令行 --selftest 只截图自检不点击
 # 后台点击实现：'adb' = 经 MuMu 自带 adb 注入安卓触摸事件（MuMu12 的 Qt 窗口收不到
 # PostMessage 消息，实测必须走这条路，推荐）；'post' = PostMessage 窗口消息（仅备用）
 MSG_CLICK_METHOD = 'adb'
-# adb.exe 路径；留空自动检测（PATH -> MuMu 安装目录 shell/ 下 -> 常见安装路径）
+# adb.exe 路径；留空自动检测（MuMu 自带 -> PATH -> 常见安装路径）
 ADB_PATH = ''
 # adb 连接串；留空自动尝试 MuMu 默认端口 127.0.0.1:16384（多开实例每实例+32）
 ADB_SERIAL = ''
 # 以下仅在 MSG_CLICK_METHOD='post' 时生效：点击消息发给渲染子窗口 nemudisplay
 MSG_CLICK_TO_CHILD = False
-PW_RENDERFULLCONTENT = 0x00000002  # PrintWindow 标志：强制 DWM 重绘完整窗口内容
+PW_RENDERFULLCONTENT = 0x00000002  # PrintWindow 兼容兜底标志
+ADB_CAPTURE_CACHE_TTL = 0.08  # adb 截图缓存（秒），避免同一轮重复启动 adb
 
 # 多开支持：--multi 一键为每个模拟器窗口各启动一个脚本实例（各自控制台）；
 # --title <窗口标题> 锁定某个窗口；--port <adb端口> 锁定 adb 连接；
@@ -243,6 +244,8 @@ RENDER_CHILD = None  # 后台模式：渲染子窗口 nemudisplay 句柄
 WINDOW_REGION = None  # 顶层窗口实际屏幕区域（left, top, width, height）
 RENDER_REGION = None  # 渲染子窗口客户区实际屏幕区域（left, top, width, height）
 _PW_FAILED_WARNED = False  # PrintWindow 失败只告警一次，避免刷屏
+_DESKTOP_CAPTURE_WARNED = False
+_ADB_CAPTURE_WARNED = False
  
  
 # PyInstaller打包支持
@@ -265,7 +268,7 @@ def resource_path(relative_path):
 TEMPLATES_DIR = resource_path(TEMPLATES_DIR)
  
  
-# === 后台模式：PrintWindow 截图 + PostMessage 点击 ===
+# === 后台模式：adb screencap 截图 + adb/PostMessage 点击 ===
 def find_target_hwnd(restore_minimized=False):
     """按标题列表查找模拟器窗口句柄（后台模式用），取面积最大者
 
@@ -357,9 +360,16 @@ def msg_get_render_region(hwnd, render_child=None):
 def msg_refresh_window():
     """刷新窗口/渲染区；识别统一使用 1280x720，窗口移动或缩放后自动跟随。"""
     global TARGET_HWND, RENDER_CHILD, WINDOW_REGION, RENDER_REGION, SCREEN_REGION
+    old_hwnd = TARGET_HWND
     hwnd = find_target_hwnd()
     if hwnd is None:
         return False
+    if hwnd != old_hwnd:
+        _clear_adb_capture_cache()
+        _ADB['serial'] = None
+        _ADB['size'] = None
+        _ADB['tap_size'] = None
+        _ADB['fail_time'] = 0.0
 
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     window_rect = (left, top, right - left, bottom - top)
@@ -408,12 +418,50 @@ def _normalized_region_to_screen(region):
     return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
 
 
-def msg_capture_window():
-    """PrintWindow 截取整个模拟器窗口（含边框），窗口被遮挡也能拿到画面
+def msg_capture_desktop(rect):
+    """从桌面 DC 截取窗口可见区域。"""
+    left, top, right, bottom = rect
+    width, height = right - left, bottom - top
+    screen_dc = source_dc = memory_dc = bmp = None
+    try:
+        screen_dc = win32gui.GetDC(0)
+        source_dc = win32ui.CreateDCFromHandle(screen_dc)
+        memory_dc = source_dc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(source_dc, width, height)
+        memory_dc.SelectObject(bmp)
+        rop = win32con.SRCCOPY | getattr(win32con, 'CAPTUREBLT', 0x40000000)
+        memory_dc.BitBlt((0, 0), (width, height), source_dc, (left, top), rop)
+        info = bmp.GetInfo()
+        bits = bmp.GetBitmapBits(True)
+        return np.frombuffer(bits, np.uint8).reshape(
+            info['bmHeight'], info['bmWidth'], 4)[:, :, :3].copy()
+    except Exception as e:
+        print(f" 桌面区域截图失败: {e}")
+        return None
+    finally:
+        try:
+            if bmp is not None:
+                win32gui.DeleteObject(bmp.GetHandle())
+            if memory_dc is not None:
+                memory_dc.DeleteDC()
+            if source_dc is not None:
+                source_dc.DeleteDC()
+            if screen_dc is not None:
+                win32gui.ReleaseDC(0, screen_dc)
+        except Exception:
+            pass
 
-    返回 (BGR图像, 窗口left, top, width, height)；失败返回 None。
+
+def msg_capture_window():
+    """优先使用 adb screencap；失败时回退 PrintWindow/桌面截图。
+
+    返回 (BGR图像, 窗口left, top, width, height)，失败时返回 None。
     """
-    global _PW_FAILED_WARNED
+    global _PW_FAILED_WARNED, _DESKTOP_CAPTURE_WARNED
+    adb_cap = msg_capture_adb()
+    if adb_cap is not None:
+        return adb_cap
     hwnd = TARGET_HWND
     if not hwnd:
         return None
@@ -436,7 +484,16 @@ def msg_capture_window():
             info['bmHeight'], info['bmWidth'], 4)[:, :, :3].copy()
         if not ok and not _PW_FAILED_WARNED:
             _PW_FAILED_WARNED = True
-            print(" PrintWindow 返回失败，画面可能不完整（黑屏时可尝试切换 MuMu 渲染模式）")
+            print(" PrintWindow 截图失败，尝试桌面区域截图")
+        if not ok or float(img.std()) < 3.0:
+            if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                return None
+            desktop_img = msg_capture_desktop((left, top, right, bottom))
+            if desktop_img is not None:
+                if not _DESKTOP_CAPTURE_WARNED:
+                    _DESKTOP_CAPTURE_WARNED = True
+                    print(" 已切换桌面区域截图；请保持 MuMu 窗口显示且未被遮挡")
+                img = desktop_img
         return img, left, top, w, h
     except Exception as e:
         print(f" 后台截图异常: {e}")
@@ -455,24 +512,82 @@ def msg_capture_window():
             pass
 
 
+def msg_capture_adb():
+    """经 MuMu 自带 adb screencap 抓取安卓画面（新版 MuMu 截图主通道）。
+
+    返回 (BGR图像, None, None, width, height)；未就绪或失败返回 None。
+    图像就是安卓画布（通常 1280x720），不包含模拟器边框/侧栏。
+    """
+    global _ADB_CAPTURE_WARNED
+    if MSG_CLICK_METHOD != 'adb' or not adb_setup():
+        return None
+    exe = adb_exe()
+    serial = _ADB.get('serial')
+    if not exe or not serial:
+        return None
+
+    now = time.monotonic()
+    cached = _ADB_CAPTURE_CACHE.get('cap')
+    if cached is not None and now - _ADB_CAPTURE_CACHE.get('time', 0.0) < ADB_CAPTURE_CACHE_TTL:
+        return cached
+
+    try:
+        result = subprocess.run(
+            [exe, '-s', serial, 'exec-out', 'screencap', '-p'],
+            capture_output=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        data = result.stdout
+        if result.returncode != 0 or len(data) < 24 or data[:8] != b'\x89PNG\r\n\x1a\n':
+            if not _ADB_CAPTURE_WARNED:
+                _ADB_CAPTURE_WARNED = True
+                err = result.stderr.decode('utf-8', 'ignore').strip()
+                print(' adb 截图失败（' + (err or '无 PNG 数据') + '），回退 PrintWindow/桌面截图')
+            return None
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        cap = (img, None, None, int(w), int(h))
+        _ADB_CAPTURE_CACHE['time'] = time.monotonic()
+        _ADB_CAPTURE_CACHE['cap'] = cap
+        return cap
+    except Exception as e:
+        if not _ADB_CAPTURE_WARNED:
+            _ADB_CAPTURE_WARNED = True
+            print(' adb 截图异常: ' + str(e) + '，回退 PrintWindow/桌面截图')
+        return None
+
+
 def msg_screenshot_region(region):
     """截图归一化 ROI，并返回与 ROI 同尺寸的图像。
 
-    ``region`` 使用 1280x720 归一化坐标；实际截图先从渲染客户区裁剪，再
-    缩放回归一化尺寸，因此模板匹配不会受模拟器窗口大小影响。
+    ``region`` 使用 1280x720 归一化坐标。adb 截图直接按安卓画布比例裁剪；
+    PrintWindow/桌面截图则先映射到窗口坐标，再裁出渲染客户区。
     """
     cap = msg_capture_window()
     if cap is None:
         return None
     img, wl, wt, ww, wh = cap
-    if RENDER_REGION is None and WINDOW_REGION is None:
+    if ww <= 0 or wh <= 0:
         return None
 
-    sx, sy, sw, sh = _normalized_region_to_screen(region)
-    x0, y0 = sx - wl, sy - wt
-    x1, y1 = x0 + sw, y0 + sh
-    ix0, iy0 = max(0, int(x0)), max(0, int(y0))
-    ix1, iy1 = min(ww, int(x1)), min(wh, int(y1))
+    if wl is None or wt is None:
+        # adb screencap 返回的就是完整安卓画布，与模拟器窗口边框无关。
+        x0 = int(round(float(region[0]) * ww / NORMALIZED_RENDER_WIDTH))
+        y0 = int(round(float(region[1]) * wh / NORMALIZED_RENDER_HEIGHT))
+        x1 = int(round(float(region[0] + region[2]) * ww / NORMALIZED_RENDER_WIDTH))
+        y1 = int(round(float(region[1] + region[3]) * wh / NORMALIZED_RENDER_HEIGHT))
+        ix0, iy0 = max(0, x0), max(0, y0)
+        ix1, iy1 = min(ww, x1), min(wh, y1)
+    else:
+        if RENDER_REGION is None and WINDOW_REGION is None:
+            return None
+        sx, sy, sw, sh = _normalized_region_to_screen(region)
+        x0, y0 = sx - wl, sy - wt
+        x1, y1 = x0 + sw, y0 + sh
+        ix0, iy0 = max(0, int(x0)), max(0, int(y0))
+        ix1, iy1 = min(ww, int(x1)), min(wh, int(y1))
+
     out_w, out_h = max(1, int(region[2])), max(1, int(region[3]))
     if ix1 <= ix0 or iy1 <= iy0:
         return None
@@ -481,7 +596,6 @@ def msg_screenshot_region(region):
     if crop.shape[1] == out_w and crop.shape[0] == out_h:
         return crop.copy()
     return cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
-
 
 def msg_resolve_click_target(rx, ry):
     """决定点击消息发给谁，返回 (hwnd, 客户区x, 客户区y)
@@ -501,6 +615,12 @@ def msg_resolve_click_target(rx, ry):
 _ADB = {'exe': None, 'serial': None, 'size': None, 'tap_size': None, 'fail_time': 0.0,
         'manager': None}
 _ADB_ASPECT_WARNED = False
+_ADB_CAPTURE_CACHE = {'time': 0.0, 'cap': None}
+
+def _clear_adb_capture_cache():
+    _ADB_CAPTURE_CACHE['time'] = 0.0
+    _ADB_CAPTURE_CACHE['cap'] = None
+
 
 
 def _query_process_image(pid):
@@ -511,7 +631,7 @@ def _query_process_image(pid):
     if not handle:
         return None
     try:
-        buf = ctypes.create_unicode_buffer(512)
+        buf = ctypes.create_unicode_buffer(2048)
         size = ctypes.c_ulong(len(buf))
         if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
             return buf.value
@@ -521,25 +641,44 @@ def _query_process_image(pid):
 
 
 def adb_exe():
-    """定位 adb.exe：配置项 -> PATH -> 模拟器进程同目录（MuMu 的 shell 目录）-> 常见安装路径"""
+    """定位 adb.exe：配置项 -> MuMu 自带版本 -> PATH -> 常见安装路径。
+
+    MuMu 12 新版必须优先使用安装目录自带的 adb；系统 PATH 里的 Android SDK
+    adb 虽然能连接端口，但部分版本的 screencap 协议会被 MuMu 后端拒绝。
+    """
     if _ADB['exe']:
         return _ADB['exe']
-    candidates = [ADB_PATH, shutil.which('adb')]
+    candidates = []
+    if ADB_PATH:
+        candidates.append(ADB_PATH)
     if TARGET_HWND:
         try:
             _, pid = win32process.GetWindowThreadProcessId(TARGET_HWND)
             exe_path = _query_process_image(pid)
             if exe_path:
-                candidates.append(os.path.join(os.path.dirname(exe_path), 'adb.exe'))
+                device_dir = os.path.dirname(exe_path)
+                candidates.append(os.path.join(device_dir, 'adb.exe'))
+                root = device_dir.split(os.sep + 'nx_device' + os.sep)[0]
+                candidates.append(os.path.join(root, 'nx_main', 'adb.exe'))
         except Exception:
             pass
-    for fixed in (r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-                  r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\adb.exe",
-                  r"D:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-                  r"C:\Program Files (x86)\Nemu\EmulatorShell\adb.exe"):
+    candidates.append(shutil.which('adb'))
+    for fixed in ("C:/Program Files/Netease/MuMu/nx_main/adb.exe",
+                  "D:/Program Files/Netease/MuMu/nx_main/adb.exe",
+                  "C:/Program Files/Netease/MuMuPlayer-12.0/shell/adb.exe",
+                  "C:/Program Files/Netease/MuMuPlayerGlobal-12.0/shell/adb.exe",
+                  "D:/Program Files/Netease/MuMuPlayer-12.0/shell/adb.exe",
+                  "C:/Program Files (x86)/Nemu/EmulatorShell/adb.exe"):
         candidates.append(fixed)
+    seen = set()
     for c in candidates:
-        if c and os.path.isfile(c):
+        if not c:
+            continue
+        c = os.path.abspath(c)
+        if c in seen:
+            continue
+        seen.add(c)
+        if os.path.isfile(c):
             _ADB['exe'] = c
             return c
     return None
@@ -682,6 +821,7 @@ def adb_setup():
         if match:
             _ADB['serial'] = serial
             _ADB['size'] = (int(match.group(1)), int(match.group(2)))
+            _clear_adb_capture_cache()
             tap_size = adb_tap_size()
             _ADB['tap_size'] = tap_size or _ADB['size']
             extra = (f"，点击坐标系 {tap_size[0]}x{tap_size[1]}（按当前旋转）"
@@ -750,7 +890,7 @@ def msg_click(x, y):
 
 
 def run_backend_selftest():
-    """后台模式自检：只做 PrintWindow 截图并保存，不做任何点击，供人工确认画面有效"""
+    """后台模式自检：优先做 adb screencap 截图并保存，不做任何点击，供人工确认画面有效"""
     print("=== 后台模式自检（只截图，不点击）===")
     if not msg_refresh_window():
         print("❌ 未找到模拟器窗口，请先启动 MuMu 和游戏")
@@ -758,7 +898,7 @@ def run_backend_selftest():
     print(f"顶层窗口句柄: {TARGET_HWND}, 渲染子窗口: {RENDER_CHILD}, 区域: {SCREEN_REGION}")
     cap = msg_capture_window()
     if cap is None:
-        print("❌ 后台截图失败，请检查模拟器窗口是否正常（可尝试切换 MuMu 渲染模式）")
+        print("❌ 后台截图失败，请检查 MuMu、adb 和游戏画面是否正常")
         return
     img, _, _, _, _ = cap
     os.makedirs(DEBUG_SHOT_DIR, exist_ok=True)
@@ -798,7 +938,7 @@ def human_like_click(x=None, y=None, jitter=10):
 def take_safe_screenshot(region):
     """安全地截取屏幕区域，防止无效参数
 
-    后台模式走 PrintWindow：窗口被遮挡也能截图；
+    后台模式优先走 MuMu adb screencap，窗口被遮挡也能截图；
     截图失败返回全黑图（模板自然匹配不上，等下一轮窗口恢复）。
     """
     img = msg_screenshot_region(region)
@@ -2475,7 +2615,8 @@ def prepare_backend():
     """
     if not HAS_WIN32:
         return "后台模式需要 pywin32：pip install pywin32"
-    print("🛰️ 运行模式: 后台（PrintWindow + PostMessage），模拟器窗口可被遮挡，但不要最小化")
+    print("🛰️ 运行模式: 后台（adb screencap + adb 点击，PrintWindow 兼容兜底），"
+          "模拟器窗口可被遮挡，但不要最小化")
     if not msg_refresh_window():
         return "未找到模拟器窗口，请先启动 MuMu 和游戏"
     print(f"🖥️ 模拟器区域: {SCREEN_REGION}")
