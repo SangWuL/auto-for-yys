@@ -1,0 +1,2 @@
+# Windows command scripts require CRLF line endings.
+*.bat text eol=crlf
